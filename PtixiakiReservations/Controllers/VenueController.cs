@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -47,16 +47,37 @@ namespace PtixiakiReservations.Controllers
             return View(venues2);
         }
 
-        [Authorize(Roles = "Admin,Venue")]
-        public async Task<IActionResult> MyVenues()
+        [Authorize(Roles = "Admin,Venue,SuperOrganizer")]
+        public async Task<IActionResult> MyVenues(string filter = "mine", int page = 1, int pageSize = 12)
         {
             string userId = _userManager.GetUserId(HttpContext.User);
-            var venues = await _context.Venue
+            ViewBag.CurrentFilter = filter;
+            ViewBag.CurrentPage = page;
+            ViewBag.PageSize = pageSize;
+
+            var query = _context.Venue
                 .Include(v => v.City)
-                .Where(v => v.UserId == userId)
+                .Include(v => v.VenueCategory)
+                    .ThenInclude(vc => vc.EventType)
+                .AsQueryable();
+
+            if (filter != "all") 
+            {
+                query = query.Where(v => v.UserId == userId);
+            }
+
+            // Calculate global stats for the filtered set before applying pagination
+            int totalCount = await query.CountAsync();
+            ViewBag.TotalCount = totalCount;
+            ViewBag.TotalPages = (int)Math.Ceiling((double)totalCount / pageSize);
+            ViewBag.CityCount = await query.Select(v => v.CityId).Distinct().CountAsync();
+
+            // Fetch only the venues for the current page
+            var venues = await query
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
                 .ToListAsync();
 
-            // Get subarea counts for each venue
             var subAreaCounts = new Dictionary<int, int>();
             var imagePaths = new Dictionary<int, string>();
             
@@ -64,17 +85,16 @@ namespace PtixiakiReservations.Controllers
             {
                 var count = await _context.SubArea.CountAsync(sa => sa.VenueId == venue.Id);
                 subAreaCounts[venue.Id] = count;
-                
-                // Add image path validation
+
                 imagePaths[venue.Id] = GetImagePath(venue.imgUrl);
             }
 
             ViewBag.SubAreaCounts = subAreaCounts;
             ViewBag.ImagePaths = imagePaths;
 
-            // Count events for all venues managed by this user
+            // Global event count for this specific filter
             var eventCount = await _context.Event
-                .Where(e => venues.Select(v => v.Id).Contains(e.VenueId))
+                .Where(e => query.Any(v => v.Id == e.VenueId))
                 .CountAsync();
 
             ViewBag.EventCount = eventCount;
@@ -127,7 +147,7 @@ namespace PtixiakiReservations.Controllers
 
         [HttpPost]
         [Obsolete]
-        [Authorize(Roles = "Venue,Admin")]
+        [Authorize(Roles = "Admin,Venue")]
         public async Task<IActionResult> Edit(VenueViewModel model)
         {
             Venue venue =
@@ -183,19 +203,14 @@ namespace PtixiakiReservations.Controllers
             return RedirectToAction("details", new { id = venue.Id });
         }
 
-        // GET: Shops/Create
-        [Authorize(Roles = "Venue,Admin")]
+        [Authorize(Roles = "Admin,Venue,SuperOrganizer")]
         public IActionResult Create()
         {
             string id = _userManager.GetUserId(HttpContext.User);
-            var tmp = _context.Venue.Include(v => v.City).Where(s => s.UserId == id).ToList();
-
-            // if (tmp.Count != 0)
-            // {
-            //     ViewBag.Error = string.Format("You can have only 1 Venue");
-            //     return View("Error");
-            // }
+            
             ViewBag.ListOfCity = _context.City.ToList();
+            ViewBag.EventTypes = new MultiSelectList(_context.EventType.ToList(), "Id", "Name");
+            
             return View();
         }
 
@@ -232,10 +247,31 @@ namespace PtixiakiReservations.Controllers
                 };
                 _context.Add(newshop);
                 await _context.SaveChangesAsync();
+
+                if (model.SelectedEventTypeIds != null && model.SelectedEventTypeIds.Any())
+                {
+                    var categoriesToAttach = model.SelectedEventTypeIds.Select(typeId => new VenueCategory
+                    {
+                        VenueId = newshop.Id,
+                        CategoryId = typeId
+                    }).ToList();
+
+                    _context.VenueCategory.AddRange(categoriesToAttach);
+                    await _context.SaveChangesAsync();
+                }
+                else
+                {
+                    _context.VenueCategory.Add(new VenueCategory
+                    {
+                        VenueId = newshop.Id,
+                        CategoryId = null 
+                    });
+                }
                 return RedirectToAction("details", new { id = newshop.Id });
             }
-            ViewBag.Error = string.Format("Something Went Wrong");
-            return View("Error");
+            ViewBag.ListOfCity = new SelectList(_context.City.ToList(), "Id", "Name", model.CityId);
+            ViewBag.EventTypes = new MultiSelectList(_context.EventType.ToList(), "Id", "Name", model.SelectedEventTypeIds);
+            return View(model);
         }
 
         // GET: Venue/Details/5
@@ -248,6 +284,8 @@ namespace PtixiakiReservations.Controllers
 
             var venue = await _context.Venue
                 .Include(v => v.City)
+                .Include(v => v.VenueCategory)           // YOU NEED THIS
+                    .ThenInclude(vc => vc.EventType)
                 .FirstOrDefaultAsync(v => v.Id == id);
         
             if (venue == null)
@@ -297,7 +335,7 @@ namespace PtixiakiReservations.Controllers
         }
         
         [HttpGet]
-        [Authorize(Roles = "Venue,Admin")]
+        [Authorize(Roles = "Admin,Venue,SuperOrganizer")]
         public IActionResult GetVenuesForUser()
         {
             string userId = _userManager.GetUserId(HttpContext.User);

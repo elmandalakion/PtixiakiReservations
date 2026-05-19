@@ -19,14 +19,11 @@ namespace PtixiakiReservations.Data
         public DbSet<Reservation> Reservation { get; set; }
         public DbSet<SubArea> SubArea { get; set; }
         public DbSet<Event> Event { get; set; }
-        public DbSet<FamilyEvent> FamilyEvent { get; set; }
         public DbSet<Seat> Seat { get; set; }
-
         public DbSet<City> City { get; set; }
-
         public DbSet<EventType> EventType { get; set; }
+		public DbSet<VenueCategory> VenueCategory { get; set; }
 
-		public DbSet<Date> Date { get; set; }
 
 
 	protected override void OnModelCreating(ModelBuilder modelbuilder)

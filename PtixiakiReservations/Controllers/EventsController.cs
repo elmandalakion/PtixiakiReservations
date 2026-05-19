@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -14,6 +15,8 @@ using PtixiakiReservations.Models;
 using PtixiakiReservations.Models.ViewModels;
 using PtixiakiReservations.Services;
 using System.Text;
+using Microsoft.AspNetCore.Hosting; 
+using Microsoft.AspNetCore.Http;    
 
 namespace PtixiakiReservations.Controllers;
 
@@ -22,13 +25,23 @@ public class EventsController(
     UserManager<ApplicationUser> userManager,
     RoleManager<ApplicationRole> roleManager,
     IElasticSearch elasticSearchService,
-    ILogger<EventsController> logger)
+    ILogger<EventsController> logger,
+    IWebHostEnvironment environment)
     : Controller
 {
     // GET: Events
-    [AllowAnonymous]
-    public IActionResult Index()
+    [Authorize]
+    [HttpGet]
+    public async Task<IActionResult> Index(int page = 1, int pageSize = 12)
     {
+        var query = context.Event.AsQueryable();
+
+        int totalCount = await query.CountAsync();
+
+
+        ViewBag.CurrentPage = page;
+        ViewBag.PageSize = pageSize;
+        ViewBag.TotalPages = totalCount == 0 ? 1 : (int)Math.Ceiling((double)totalCount / pageSize);
         return View();
     }
 
@@ -200,42 +213,43 @@ public class EventsController(
         }
     }
 
-    [AllowAnonymous]
+   [AllowAnonymous]
     public async Task<IActionResult> EventsForToday(string city, int page = 1, int pageSize = 12)
     {
-        logger.LogInformation("Fetching events for today and future. City filter: {City}", city ?? "None");
-
         var today = DateTime.Today;
-
         var eventsQuery = context.Event
             .Include(e => e.Venue)
             .ThenInclude(v => v.City)
-            .Where(e => e.StartDateTime.Date >= today.AddDays(-30) &&
-                        e.StartDateTime.Date <= today.AddDays(60))
-            .OrderBy(e => e.StartDateTime);
+            .Where(e => e.ParentEventId == null); 
 
         if (!string.IsNullOrWhiteSpace(city))
         {
-            eventsQuery = (IOrderedQueryable<Event>)eventsQuery
-                .Where(e => e.Venue.City.Name.ToLower() == city.ToLower());
+            eventsQuery = eventsQuery.Where(e => e.Venue.City.Name.ToLower() == city.ToLower());
         }
+
+        eventsQuery = eventsQuery.OrderBy(e => e.StartDateTime);
+
+        int totalMasterEvents = await eventsQuery.CountAsync();
+
+
+        ViewBag.TotalMasterEvents = totalMasterEvents; 
+        ViewBag.TotalPages = (int)Math.Ceiling((double)totalMasterEvents / pageSize);
+        ViewBag.CurrentPage = page;
 
         var eventsList = await eventsQuery
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
             .ToListAsync();
 
-        // Add debug info to see event dates
-        var todayEvents = eventsList.Count(e => e.StartDateTime.Date == today);
-        var upcomingEvents = eventsList.Count(e => e.StartDateTime.Date > today);
-        var pastEvents = eventsList.Count(e => e.StartDateTime.Date < today);
+        var masterIds = eventsList.Select(e => e.Id).ToList();
 
-        logger.LogInformation(
-            "Found {Count} events. Distribution: Today: {TodayCount}, Upcoming: {UpcomingCount}, Past: {PastCount}",
-            eventsList.Count,
-            todayEvents,
-            upcomingEvents,
-            pastEvents);
+        var childCounts = await context.Event
+            .Where(e => e.ParentEventId != null && masterIds.Contains(e.ParentEventId.Value))
+            .GroupBy(e => e.ParentEventId.Value)
+            .Select(g => new { ParentId = g.Key, Count = g.Count() })
+            .ToDictionaryAsync(x => x.ParentId, x => x.Count);
+
+        ViewBag.ChildCounts = childCounts;
 
         return View(eventsList);
     }
@@ -250,8 +264,11 @@ public class EventsController(
 
         var eventDetails = await context.Event
             .Include(e => e.Venue)
+            .Include(e => e.ParentEvent) 
             .Include(e => e.Venue.City)
             .Include(e => e.EventType)
+            .Include(e => e.ChildEvents) 
+            .ThenInclude(c => c.SubArea)
             .FirstOrDefaultAsync(m => m.Id == id);
 
         if (eventDetails == null)
@@ -311,7 +328,6 @@ public class EventsController(
 
             // Fetch the venues associated with the current user
             var venues = await context.Venue
-                .Where(v => v.UserId == userId)
                 .Select(v => new SelectListItem
                 {
                     Value = v.Id.ToString(),
@@ -356,165 +372,160 @@ public class EventsController(
     [ValidateAntiForgeryToken]
     public async Task<IActionResult> CreateEvent(
         Event newEvent,
+        IFormFile? imageFile,
         string IsMultiDay = null,
         string StartDate = null,
         string EndDate = null,
         string StartTime = null,
-        string EndTime = null)
+        string MultiEndTime = null)
     {
         bool isMultiDay = IsMultiDay == "on" || IsMultiDay == "true";
-        
+        var userId = userManager.GetUserId(User);
+
+        // 1. Handle Image Upload First
+        if (imageFile != null && imageFile.Length > 0)
+        {
+            try
+            {
+                string uploadsFolder = Path.Combine(environment.WebRootPath, "images/events");
+                if (!Directory.Exists(uploadsFolder)) Directory.CreateDirectory(uploadsFolder);
+
+                string uniqueFileName = Guid.NewGuid().ToString() + "_" + Path.GetFileName(imageFile.FileName);
+                string filePath = Path.Combine(uploadsFolder, uniqueFileName);
+
+                using (var fileStream = new FileStream(filePath, FileMode.Create))
+                {
+                    await imageFile.CopyToAsync(fileStream);
+                }
+
+                newEvent.ImagePath = "/images/events/" + uniqueFileName;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error saving event image to disk.");
+                // Returning BadRequest so the fetch API knows it failed
+                return BadRequest(new { success = false, message = "Error saving image." });
+            }
+        }
+
         try
         {
             logger.LogInformation("Processing event creation. isMultiDay: {isMultiDay}", isMultiDay);
-            var userId = userManager.GetUserId(User);
 
-            // For debugging
-            logger.LogInformation("Received event data: Name={Name}, VenueId={VenueId}, EventTypeId={EventTypeId}",
-                newEvent.Name, newEvent.VenueId, newEvent.EventTypeId);
-
-            // Check model state
+            // 2. Validate Model State
             if (!ModelState.IsValid)
             {
-                logger.LogWarning("Model state is invalid. Errors: {Errors}",
-                    string.Join(", ", ModelState.Values
-                        .SelectMany(v => v.Errors)
-                        .Select(e => e.ErrorMessage)));
-
-                // Reload the dropdowns for the form
-                var venues = await context.Venue
-                    .Where(v => v.UserId == userId)
-                    .Select(v => new SelectListItem
-                    {
-                        Value = v.Id.ToString(),
-                        Text = v.Name
-                    }).ToListAsync();
-
-                ViewBag.VenueList = venues;
-                ViewBag.EventTypeList = new SelectList(await context.EventType.ToListAsync(), "Id", "Name");
-
-                return View(newEvent);
+                var errors = ModelState.Values.SelectMany(v => v.Errors).Select(e => e.ErrorMessage);
+                logger.LogWarning("Model state is invalid.");
+                return BadRequest(new { success = false, message = "Invalid form data.", errors });
             }
 
-            // Verify venue belongs to the current user
-            var venue = await context.Venue.FirstOrDefaultAsync(v => v.Id == newEvent.VenueId && v.UserId == userId);
+            // 3. Verify venue belongs to the current user
+            var venue = await context.Venue.FirstOrDefaultAsync(v => v.Id == newEvent.VenueId);
             if (venue == null)
             {
-                logger.LogWarning("User {UserId} attempted to create event for venue {VenueId} they don't own", userId,
-                    newEvent.VenueId);
-                ModelState.AddModelError("VenueId", "You can only create events for venues you own.");
-
-                // Reload the dropdowns for the form
-                ViewBag.VenueList = await context.Venue
-                    .Where(v => v.UserId == userId)
-                    .Select(v => new SelectListItem
-                    {
-                        Value = v.Id.ToString(),
-                        Text = v.Name
-                    }).ToListAsync();
-
-                ViewBag.EventTypeList = new SelectList(await context.EventType.ToListAsync(), "Id", "Name");
-
-                return View(newEvent);
+                logger.LogWarning("Venue {VenueId} not found", newEvent.VenueId);
+                return BadRequest(new { success = false, message = "Venue does not exist." });
             }
 
+            // Variable to hold our newly created Father event, declared out here 
+            // so we can grab its ID at the very end of the function!
+            Event fatherEvent = null;
+
+            // 4. Handle Save Logic
             if (isMultiDay && !string.IsNullOrEmpty(StartDate) && !string.IsNullOrEmpty(EndDate)
-                && !string.IsNullOrEmpty(StartTime) && !string.IsNullOrEmpty(EndTime))
+                && !string.IsNullOrEmpty(StartTime) && !string.IsNullOrEmpty(MultiEndTime))
             {
-                // Handle multi-day event creation
                 logger.LogInformation("Creating multi-day events from {StartDate} to {EndDate}", StartDate, EndDate);
 
                 DateTime startDate = DateTime.Parse(StartDate);
                 DateTime endDate = DateTime.Parse(EndDate);
                 
-                // Handle time parsing - extract time portion if it's a datetime string
-                TimeSpan startTimeSpan;
-                TimeSpan endTimeSpan;
-                
-                if (DateTime.TryParse(StartTime, out DateTime parsedStartTime))
-                {
-                    // If it parses as DateTime, extract the time portion
-                    startTimeSpan = parsedStartTime.TimeOfDay;
-                }
-                else
-                {
-                    // Otherwise parse as TimeSpan directly
-                    startTimeSpan = TimeSpan.Parse(StartTime);
-                }
-                
-                if (DateTime.TryParse(EndTime, out DateTime parsedEndTime))
-                {
-                    // If it parses as DateTime, extract the time portion
-                    endTimeSpan = parsedEndTime.TimeOfDay;
-                }
-                else
-                {
-                    // Otherwise parse as TimeSpan directly
-                    endTimeSpan = TimeSpan.Parse(EndTime);
-                }
+                TimeSpan startTimeSpan = DateTime.TryParse(StartTime, out DateTime pst) ? pst.TimeOfDay : TimeSpan.Parse(StartTime);
+                TimeSpan endTimeSpan = DateTime.TryParse(MultiEndTime, out DateTime pet) ? pet.TimeOfDay : TimeSpan.Parse(MultiEndTime);
 
-                // Create events for each day in the range
+                var count = 1;
                 for (DateTime date = startDate; date <= endDate; date = date.AddDays(1))
                 {
                     var eventForDay = new Event
                     {
-                        Name = newEvent.Name,
+                        Name = newEvent.Name+" Day "+count,
                         VenueId = newEvent.VenueId,
                         EventTypeId = newEvent.EventTypeId,
-                        SubAreaId = newEvent.SubAreaId,  // Include SubAreaId for multi-day events
+                        SubAreaId = newEvent.SubAreaId,
                         StartDateTime = date.Add(startTimeSpan),
-                        EndTime = date.Add(endTimeSpan)
+                        EndTime = date.Add(endTimeSpan),
+                        ImagePath = newEvent.ImagePath 
                     };
 
-                    context.Add(eventForDay);
+                    if (newEvent.ParentEventId.HasValue)
+                    {
+                        eventForDay.ParentEventId = newEvent.ParentEventId;
+                        context.Add(eventForDay);
+                    }
+                    count++;
                 }
-
-                await context.SaveChangesAsync();
-
-                return RedirectToAction("Index");
             }
             else
             {
-                // Handle single event creation
+                // Single event creation
                 logger.LogInformation("Creating single event on {Date}", newEvent.StartDateTime);
 
-                // Make sure StartDateTime and EndTime are properly set
                 if (newEvent.StartDateTime == DateTime.MinValue)
-                {
                     newEvent.StartDateTime = DateTime.Now;
-                }
 
                 if (newEvent.EndTime == DateTime.MinValue)
-                {
                     newEvent.EndTime = newEvent.StartDateTime.AddHours(2);
-                }
 
                 context.Add(newEvent);
-                await context.SaveChangesAsync();
-
-                return RedirectToAction("Index");
             }
+
+            // Save everything to the database
+            await context.SaveChangesAsync();
+
+            // 5. DETERMINE WHAT ID TO SEND BACK TO JAVASCRIPT
+            int? returnedEventId = newEvent.ParentEventId; 
+
+            // If ParentEventId is null, they just created a brand new Master Event!
+            if (returnedEventId == null)
+            {
+                // If they did a multi-day master event, the ID we want is the fatherEvent
+                if (isMultiDay && fatherEvent != null)
+                {
+                    returnedEventId = fatherEvent.Id;
+                }
+                else // If they did a single day master event, the ID is just the newEvent
+                {
+                    returnedEventId = newEvent.Id;
+                }
+            }
+
+            // Return the JSON data so the JavaScript can automatically switch to Sub-Event Mode
+            return Json(new { 
+            success = true, 
+            eventId = returnedEventId, 
+            eventName = newEvent.Name,
+            venueId = newEvent.VenueId,
+            venueName = venue.Name,
+            eventTypeId = newEvent.EventTypeId
+        });
         }
         catch (Exception ex)
         {
             logger.LogError(ex, "Error creating event");
-
-            // Reload the dropdowns for the form
-            var userId = userManager.GetUserId(User);
-            ViewBag.VenueList = await context.Venue
-                .Where(v => v.UserId == userId)
-                .Select(v => new SelectListItem
-                {
-                    Value = v.Id.ToString(),
-                    Text = v.Name
-                }).ToListAsync();
-
-            ViewBag.EventTypeList = new SelectList(await context.EventType.ToListAsync(), "Id", "Name");
-
-            ModelState.AddModelError("", "An error occurred while creating the event. Please try again.");
-            return View(newEvent);
+            return BadRequest(new { success = false, message = "An error occurred while creating the event." });
         }
     }
+
+// Private helper to keep the Create function clean
+private async Task ReloadCreateDropdowns(string userId)
+{
+    ViewBag.VenueList = await context.Venue
+        .Select(v => new SelectListItem { Value = v.Id.ToString(), Text = v.Name })
+        .ToListAsync();
+
+    ViewBag.EventTypeList = new SelectList(await context.EventType.ToListAsync(), "Id", "Name");
+}
 
     [Authorize]
     public bool CorrectDay(JsonEventModel ev, int i, int everyNum)
@@ -561,10 +572,11 @@ public class EventsController(
         }
 
         var ev = await context.Event
-            .Include(r => r.FamilyEvent)
+            .Include(r => r.ParentEvent) 
             .Include(r => r.Venue)
             .Include(r => r.EventType)
             .FirstOrDefaultAsync(m => m.Id == id);
+            
         if (ev == null)
         {
             return NotFound();
@@ -572,15 +584,23 @@ public class EventsController(
 
         if (dAll == true)
         {
-            var familyEvents = context.Event.Include(r => r.FamilyEvent).Include(r => r.EventType)
-                .Where(e => e.FamilyEventId == ev.FamilyEventId).ToList();
-            foreach (var @event in familyEvents)
+            // Figure out the parent ID (if ev IS the parent, use its own Id)
+            var targetParentId = ev.ParentEventId ?? ev.Id;
+
+            // Grab the parent and all its children
+            var relatedEvents = context.Event
+                .Include(r => r.ParentEvent)
+                .Include(r => r.EventType)
+                .Where(e => e.Id == targetParentId || e.ParentEventId == targetParentId)
+                .ToList();
+
+            foreach (var @event in relatedEvents)
             {
                 var hasReservations = context.Reservation.Where(r => r.EventId == @event.Id).ToList();
                 context.Reservation.RemoveRange(hasReservations);
             }
 
-            context.Event.RemoveRange(familyEvents);
+            context.Event.RemoveRange(relatedEvents);
         }
         else
         {
@@ -593,7 +613,6 @@ public class EventsController(
         Response.StatusCode = (int)HttpStatusCode.OK;
         return Json(Response.StatusCode);
     }
-
     private bool EventExists(int id)
     {
         return context.Event.Any(e => e.Id == id);
@@ -631,15 +650,17 @@ public class EventsController(
         string startDate = null,
         string endDate = null,
         string searchTerm = null,
+        string sort = "asc",
         int page = 1,
         int pageSize = 12)
     {
         logger.LogInformation(
-            "Event search with criteria: EventType={EventType}, StartDate={StartDate}, EndDate={EndDate}, SearchTerm={SearchTerm}",
+            "Event search with criteria: EventType={EventType}, StartDate={StartDate}, EndDate={EndDate}, SearchTerm={SearchTerm}, Sort={Sort}",
             eventTypeId,
             startDate,
             endDate,
-            searchTerm);
+            searchTerm,
+            sort);
 
         try
         {
@@ -665,11 +686,20 @@ public class EventsController(
                 parsedEndDate = endDateValue.Date.AddDays(1).AddSeconds(-1);
             }
 
-            // Use standard database query for better date filtering
+            // Determine if the user is filtering by date
+            bool hasDateFilter = !string.IsNullOrWhiteSpace(startDate) || !string.IsNullOrWhiteSpace(endDate);
+
+            // Use standard database query
             var query = context.Event
                 .Include(e => e.Venue)
                 .ThenInclude(v => v.City)
                 .AsQueryable();
+
+            // ONLY apply the Parent-only filter if NO date filter was provided
+            if (!hasDateFilter)
+            {
+                query = query.Where(e => e.ParentEventId == null);
+            }
 
             // Apply filters based on provided criteria
             if (!string.IsNullOrWhiteSpace(eventTypeId) && int.TryParse(eventTypeId, out int eventTypeIdValue))
@@ -700,7 +730,14 @@ public class EventsController(
             }
 
             // Order by start date (nearest first)
-            query = query.OrderBy(e => e.StartDateTime);
+            if (sort == "desc")
+            {
+                query = query.OrderByDescending(e => e.StartDateTime);
+            }
+            else
+            {
+                query = query.OrderBy(e => e.StartDateTime);
+            }
 
             // Get total count for pagination
             var totalCount = await query.CountAsync();
@@ -709,12 +746,24 @@ public class EventsController(
             var events = await query
                 .Skip((page - 1) * pageSize)
                 .Take(pageSize)
+                .Select(e => new
+                {
+                    e.Id,
+                    e.Name,
+                    e.StartDateTime,
+                    e.EndTime,
+                    ImagePath = e.ImagePath ?? e.ParentEvent.ImagePath,
+                    VenueName = e.Venue.Name,
+                    CityName = e.Venue.City != null ? e.Venue.City.Name : "N/A",
+                    parentEventId = e.ParentEventId,
+                    childCount = context.Event.Count(c => c.ParentEventId == e.Id)
+                })
                 .ToListAsync();
 
             // Return results as JSON
             return Json(new
             {
-                events,
+                events, // This now contains the projected objects with the ImagePath
                 totalCount,
                 currentPage = page,
                 totalPages = (int)Math.Ceiling(totalCount / (double)pageSize)
@@ -875,24 +924,35 @@ public class EventsController(
         });
     }
 
-    [Authorize]
     [HttpGet]
-    public async Task<IActionResult> GetUserEvents()
+    [Authorize]
+    public async Task<IActionResult> GetUserEvents(int page = 1, int pageSize = 12)
     {
-        // Get the current user ID
-        var userId = userManager.GetUserId(User);
+        try
+        {
+            var query = context.Event.AsQueryable();
 
-        // Get all events created by the user
-        var events = await context.Event
-            .Include(e => e.EventType)
-            .Include(e => e.Venue)
-            .Where(e => e.Venue.UserId == userId)
-            .OrderByDescending(e => e.StartDateTime)
-            .ToListAsync();
+            var events = await query
+                .OrderByDescending(e => e.StartDateTime)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .Select(e => new {
+                    id = e.Id,
+                    name = e.Name,
+                    startDateTime = e.StartDateTime,
+                    endTime = e.EndTime,
+                    venueId = e.VenueId,
+                    venue = e.Venue != null ? new { name = e.Venue.Name } : null,
+                    eventType = e.EventType != null ? new { name = e.EventType.Name } : null
+                })
+                .ToListAsync();
 
-        logger.LogInformation("Found {Count} events for user {UserId}", events.Count, userId);
-
-        return Json(events);
+            return Json(new { success = true, events = events });
+        }
+        catch (Exception ex)
+        {
+            return Json(new { success = false, message = ex.Message, inner = ex.InnerException?.Message });
+        }
     }
 
     [AllowAnonymous]
@@ -1009,17 +1069,7 @@ public class EventsController(
             return NotFound();
         }
 
-        // Check if the current user owns the venue associated with this event
-        var venueOwner = await context.Venue
-            .FirstOrDefaultAsync(v => v.Id == eventToEdit.VenueId && v.UserId == userId);
-
-        if (venueOwner == null)
-        {
-            // If the user doesn't own this venue, they can't edit the event
-            logger.LogWarning("User {UserId} attempted to edit event {EventId} they don't own", userId, id);
-            TempData["ErrorMessage"] = "You can only edit events for venues you own.";
-            return RedirectToAction(nameof(Index));
-        }
+       
 
         // Get venues for dropdown
         var venues = await context.Venue
@@ -1205,5 +1255,195 @@ public class EventsController(
             }).ToListAsync();
 
         return View(updatedEvent);
+    }
+    [Authorize] 
+    [HttpGet]
+    public async Task<IActionResult> SearchParentEvents(string query)
+    {
+        var events = await context.Event
+            .Where(e => e.ParentEventId == null && e.Name.Contains(query))
+            .Select(e => new {
+                id = e.Id,
+                name = e.Name,
+                venue = e.Venue.Name,
+                venueId = e.VenueId, // Necessary for inheritance
+                eventTypeId = e.EventTypeId,
+                rawStartDate = e.StartDateTime.ToString("yyyy-MM-ddTHH:mm"),
+                rawEndDate = e.EndTime.ToString("yyyy-MM-ddTHH:mm"),
+                date = e.StartDateTime.ToString("MMM dd, yyyy")
+            })
+            .Take(5)
+            .ToListAsync();
+        return Json(events);
+    }
+
+    [HttpGet]
+    [Authorize]
+    public async Task<IActionResult> GetSubEvents(int parentId)
+    {
+        var subEvents = await context.Event
+            .Include(e => e.SubArea)
+            .Where(e => e.ParentEventId == parentId)
+            .OrderBy(e => e.StartDateTime)
+            .Select(e => new {
+                id = e.Id,
+                name = e.Name, 
+                date = e.StartDateTime.ToString("dddd, MMM d, yyyy"),
+                time = e.StartDateTime.ToString("h:mm tt") + " - " + e.EndTime.ToString("h:mm tt"),
+                layout= e.SubArea.AreaName
+            })
+            .ToListAsync();
+            
+        return Json(subEvents);
+    }
+
+    [Authorize]
+    [HttpPost]
+    public async Task<IActionResult> UpdateParentEvent([FromBody] LinkEventDto data)
+    {
+        try
+        {
+            var userId = userManager.GetUserId(User);
+            
+            // Find the child event we are editing
+            var childEvent = await context.Event
+                .Include(e => e.Venue)
+                .FirstOrDefaultAsync(e => e.Id == data.ChildId);
+
+            if (childEvent == null) return NotFound(new { success = false, message = "Event not found." });
+
+            // Security check: ensure they own the venue for this event
+            if (childEvent.Venue.UserId != userId) 
+                return Unauthorized(new { success = false, message = "Not authorized." });
+
+            // Update the relationship
+            childEvent.ParentEventId = data.ParentId;
+            await context.SaveChangesAsync();
+
+            return Json(new { success = true });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error async saving parent event");
+            return StatusCode(500, new { success = false, message = "Server error." });
+        }
+    }
+
+    // A tiny helper class to catch the JSON data
+    public class LinkEventDto
+    {
+        public int ChildId { get; set; }
+        public int? ParentId { get; set; } // Nullable in case they clear it
+    }
+
+    [AllowAnonymous]
+    public async Task<IActionResult> ChildEvents(int? id)
+    {
+        if (id == null)
+        {
+            return NotFound();
+        }
+
+        // 1. Fetch the Father event just to get its name for the page title
+        var fatherEvent = await context.Event.FirstOrDefaultAsync(e => e.Id == id);
+        if (fatherEvent == null)
+        {
+            return NotFound();
+        }
+
+        // 2. Fetch all Child events that belong to this Father
+        var childEvents = await context.Event
+            .Include(e => e.Venue)
+            .Include(e => e.Venue.City)
+            .Include(e => e.EventType)
+            .Where(e => e.ParentEventId == id)
+            .OrderBy(e => e.StartDateTime)
+            .ToListAsync();
+
+        // Pass the Father's info to the view using ViewBag
+        ViewBag.FatherEventName = fatherEvent.Name;
+        ViewBag.FatherEventId = fatherEvent.Id;
+
+        return View(childEvents);
+    }
+
+    [HttpGet]
+    public async Task<IActionResult> SearchVenues(string query)
+    {
+        var venues = await context.Venue
+            .Where(v => v.Name.ToLower().Contains(query.ToLower()))
+            .Select(v => new { id = v.Id, name = v.Name, city = v.City != null ? v.City.Name : "N/A" })
+            .Take(10)
+            .ToListAsync();
+
+        return Json(venues);
+    }
+
+    [Authorize]
+    [HttpPost]
+    public async Task<IActionResult> DuplicateSubEvent(int id)
+    {
+        var ev = await context.Event
+            .AsNoTracking()
+            .FirstOrDefaultAsync(e => e.Id == id);
+
+        if (ev == null)
+        {
+            return NotFound();
+        }
+
+
+        var newEvent = new Event
+        {
+            Name = GenerateNextName(ev.Name),
+            StartDateTime = ev.StartDateTime,
+            EndTime = ev.EndTime,
+            EventTypeId = ev.EventTypeId,
+            VenueId = ev.VenueId,
+            SubAreaId = ev.SubAreaId,
+            ParentEventId = ev.ParentEventId,
+            ImagePath = ev.ImagePath
+        };
+
+        context.Event.Add(newEvent);
+        await context.SaveChangesAsync();
+
+        return Json(new { success = true, id = newEvent.Id });
+    }
+
+    private string GenerateNextName(string currentName)
+    {
+        if (string.IsNullOrWhiteSpace(currentName)) return "New Event 1";
+
+        var match = System.Text.RegularExpressions.Regex.Match(currentName, @"(\d+)$");
+
+        if (match.Success)
+        {
+            string numberStr = match.Value;
+            if (int.TryParse(numberStr, out int number))
+            {
+                string baseName = currentName.Substring(0, match.Index).TrimEnd();
+                return $"{baseName} {number + 1}";
+            }
+        }
+
+        // If no trailing number found, append " 1"
+        return $"{currentName.TrimEnd()} 1";
+    }
+
+    [Authorize]
+    [HttpGet]
+    public async Task<IActionResult> GetEventTiming(int id)
+    {
+        var ev = await context.Event
+            .Where(e => e.Id == id)
+            .Select(e => new {
+                start = e.StartDateTime.ToString("yyyy-MM-ddTHH:mm"),
+                end = e.EndTime.ToString("yyyy-MM-ddTHH:mm")
+            })
+            .FirstOrDefaultAsync();
+
+        if (ev == null) return NotFound();
+        return Json(ev);
     }
 }
